@@ -1,0 +1,29 @@
+{
+  "3": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "example.jpg"
+    }
+  },
+  "4": {
+    "class_type": "DinoxDetector",
+    "inputs": {
+      "image": ["3", 0],
+      "text_prompt": "person . car . dog . cat . bird",
+      "api_token": "your-api-token-here",
+      "bbox_threshold": 0.25
+    }
+  },
+  "5": {
+    "class_type": "PreviewImage",
+    "inputs": {
+      "images": ["4", 0]
+    }
+  },
+  "6": {
+    "class_type": "PreviewImage",
+    "inputs": {
+      "images": ["4", 1]
+    }
+  }
+}

@@ -1,0 +1,7 @@
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+supervision>=0.18.0
+dds-cloudapi-sdk>=0.3.3
+pytest>=7.4.0
+pytest-mock>=3.11.1
