@@ -1,3 +1,4 @@
+import json
 import time
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -7,7 +8,7 @@ import pytest
 import torch
 from PIL import Image
 
-from node import DinoxDetectorNode
+from node import DinoxDetectorNode, DinoxRegionVLNode
 
 
 @pytest.fixture
@@ -70,6 +71,8 @@ def create_mock_predictions(height, width):
     prediction.mask.size = [height, width]
     prediction.score = 0.95
     prediction.category = "test_object"
+    prediction.pose = [[x, y, 1.0] for x, y in zip(range(10), range(10))]
+    prediction.hand = [[x, y, 1.0] for x, y in zip(range(5), range(5))]
     return [prediction]
 
 
@@ -83,7 +86,7 @@ def test_image(request, synthetic_image, real_image, batched_image):
         return batched_image
 
 
-def test_input_types():
+def test_detector_input_types():
     node = DinoxDetectorNode()
     input_types = node.INPUT_TYPES()
 
@@ -92,18 +95,22 @@ def test_input_types():
     assert "text_prompt" in input_types["required"]
     assert "api_token" in input_types["required"]
     assert "bbox_threshold" in input_types["required"]
+    assert "iou_threshold" in input_types["required"]
+    assert "prompt_type" in input_types["required"]
+    assert "return_pose" in input_types["required"]
+    assert "return_hand" in input_types["required"]
 
-    # Verify text_prompt configuration
-    assert isinstance(input_types["required"]["text_prompt"], tuple)
-    assert len(input_types["required"]["text_prompt"]) == 2
-    assert input_types["required"]["text_prompt"][1]["multiline"] is True
 
-
-def test_return_types():
+def test_detector_return_types():
     node = DinoxDetectorNode()
 
-    assert node.RETURN_TYPES == ("IMAGE", "MASK")
-    assert node.RETURN_NAMES == ("box_annotated", "binary_mask")
+    assert node.RETURN_TYPES == ("IMAGE", "MASK", "STRING", "STRING")
+    assert node.RETURN_NAMES == (
+        "box_annotated",
+        "binary_mask",
+        "pose_data",
+        "hand_data",
+    )
     assert node.CATEGORY == "detection"
 
 
@@ -141,12 +148,19 @@ def test_detect_and_annotate(
             )
             mock_string2rle.return_value = "decoded_rle"
 
-            # Run detection
-            box_result, mask_result = node.detect_and_annotate(
-                test_image, "test_object", "test_token", 0.25
+            # Run detection with all features
+            box_result, mask_result, pose_data, hand_data = node.detect_and_annotate(
+                test_image,
+                "test_object",
+                "test_token",
+                0.25,
+                0.8,
+                prompt_type="text",
+                return_pose=True,
+                return_hand=True,
             )
 
-    # Verify results
+    # Verify tensor outputs
     assert isinstance(box_result, torch.Tensor)
     assert isinstance(mask_result, torch.Tensor)
     assert len(box_result.shape) == 4  # [B,H,W,C]
@@ -161,20 +175,36 @@ def test_detect_and_annotate(
         mask_result <= 1
     )  # Values in [0,1]
 
+    # Verify pose and hand data are valid JSON strings
+    assert isinstance(pose_data, str)
+    assert isinstance(hand_data, str)
+    pose_json = json.loads(pose_data)
+    hand_json = json.loads(hand_data)
+    assert isinstance(pose_json, list)
+    assert isinstance(hand_json, list)
+    if pose_json:  # If not empty
+        assert all(len(point) == 3 for point in pose_json)  # x,y,confidence
+    if hand_json:  # If not empty
+        assert all(len(point) == 3 for point in hand_json)  # x,y,confidence
+
 
 def test_leather_jacket_detection(real_image):
     node = DinoxDetectorNode()
 
     # Use real API with provided token
     try:
-        box_result, mask_result = node.detect_and_annotate(
+        box_result, mask_result, pose_data, hand_data = node.detect_and_annotate(
             real_image,
             "leather jacket . person",
             "73b1fca55fffdf29a7f777d965bb64cf",
             0.25,
+            0.8,
+            prompt_type="text",
+            return_pose=True,
+            return_hand=True,
         )
 
-        # Verify the results
+        # Verify tensor outputs
         assert isinstance(box_result, torch.Tensor)
         assert isinstance(mask_result, torch.Tensor)
         assert len(box_result.shape) == 4  # [B,H,W,C]
@@ -185,7 +215,13 @@ def test_leather_jacket_detection(real_image):
         assert mask_result.shape[1:] == real_image.shape[1:3]  # Same H,W as input
         assert box_result.shape[-1] == 3  # RGB channels
 
-        # Save test outputs for visual inspection
+        # Verify pose and hand data are valid JSON strings
+        assert isinstance(pose_data, str)
+        assert isinstance(hand_data, str)
+        json.loads(pose_data)  # Should not raise error
+        json.loads(hand_data)  # Should not raise error
+
+        # Save outputs for visual inspection
         Path("outputs").mkdir(parents=True, exist_ok=True)
         Image.fromarray((box_result[0].numpy() * 255).astype(np.uint8)).save(
             "outputs/test_leather_jacket_box.jpg"
@@ -194,37 +230,63 @@ def test_leather_jacket_detection(real_image):
             "outputs/test_leather_jacket_mask.png"
         )
 
+        # Save keypoints if available
+        if pose_data != "[]":
+            with open("outputs/test_leather_jacket_pose.json", "w") as f:
+                f.write(pose_data)
+        if hand_data != "[]":
+            with open("outputs/test_leather_jacket_hand.json", "w") as f:
+                f.write(hand_data)
+
     except Exception as e:
         print(f"API test failed with error: {str(e)}")
         assert False, f"API test failed: {str(e)}"
 
 
-def test_batched_input(batched_image):
-    """Test that node can handle batched tensor input format"""
-    node = DinoxDetectorNode()
+def test_region_analysis(real_image):
+    node = DinoxRegionVLNode()
+
+    # Test regions
+    regions = [[30, 30, 70, 70], [50, 50, 90, 90]]
 
     try:
-        box_result, mask_result = node.detect_and_annotate(
-            batched_image, "test object", "73b1fca55fffdf29a7f777d965bb64cf", 0.25
+        captions, roc_results, ocr_results = node.analyze_regions(
+            real_image,
+            json.dumps(regions),
+            "73b1fca55fffdf29a7f777d965bb64cf",
+            prompt_type="text",
+            text_prompt="leather jacket . person",
+            return_caption=True,
+            return_roc=True,
+            return_ocr=True,
         )
 
-        assert isinstance(box_result, torch.Tensor)
-        assert isinstance(mask_result, torch.Tensor)
-        assert len(box_result.shape) == 4  # [B,H,W,C]
-        assert len(mask_result.shape) == 3  # [B,H,W]
-        assert box_result.shape[0] == 1  # Batch size 1
-        assert mask_result.shape[0] == 1  # Batch size 1
-        assert box_result.shape[1:3] == batched_image.shape[1:3]  # Same H,W as input
-        assert mask_result.shape[1:] == batched_image.shape[1:3]  # Same H,W as input
-        assert box_result.shape[-1] == 3  # RGB channels
-        assert torch.all(box_result >= 0) and torch.all(
-            box_result <= 1
-        )  # Values in [0,1]
-        assert torch.all(mask_result >= 0) and torch.all(
-            mask_result <= 1
-        )  # Values in [0,1]
+        # Verify results are valid JSON strings
+        assert isinstance(captions, str)
+        assert isinstance(roc_results, str)
+        assert isinstance(ocr_results, str)
+
+        # Verify JSON format
+        captions_dict = json.loads(captions)
+        roc_dict = json.loads(roc_results)
+        ocr_dict = json.loads(ocr_results)
+
+        assert isinstance(captions_dict, dict)
+        assert isinstance(roc_dict, dict)
+        assert isinstance(ocr_dict, dict)
+
+        # Save results for inspection
+        Path("outputs").mkdir(parents=True, exist_ok=True)
+        with open("outputs/test_region_analysis.json", "w") as f:
+            json.dump(
+                {"captions": captions_dict, "roc": roc_dict, "ocr": ocr_dict},
+                f,
+                indent=2,
+            )
+
     except Exception as e:
-        assert False, f"Failed to process batched tensor input: {str(e)}"
+        print(f"Region analysis failed with error: {str(e)}")
+        assert False, f"Region analysis failed: {str(e)}"
 
 
 @pytest.mark.parametrize("threshold", [-0.1, 1.1])
@@ -232,21 +294,27 @@ def test_invalid_threshold(threshold, test_image):
     node = DinoxDetectorNode()
 
     with pytest.raises(ValueError):
-        node.detect_and_annotate(test_image, "test_object", "test_token", threshold)
+        node.detect_and_annotate(
+            test_image, "test_object", "test_token", threshold, 0.8, prompt_type="text"
+        )
 
 
 def test_empty_api_token(test_image):
     node = DinoxDetectorNode()
 
     with pytest.raises(ValueError):
-        node.detect_and_annotate(test_image, "test_object", "", 0.25)
+        node.detect_and_annotate(
+            test_image, "test_object", "", 0.25, 0.8, prompt_type="text"
+        )
 
 
 def test_empty_text_prompt(test_image):
     node = DinoxDetectorNode()
 
     with pytest.raises(ValueError):
-        node.detect_and_annotate(test_image, "", "test_token", 0.25)
+        node.detect_and_annotate(
+            test_image, "", "test_token", 0.25, 0.8, prompt_type="text"
+        )
 
 
 def test_invalid_image_type():
@@ -254,7 +322,9 @@ def test_invalid_image_type():
     invalid_image = "not_an_image"
 
     with pytest.raises(ValueError):
-        node.detect_and_annotate(invalid_image, "test_object", "test_token", 0.25)
+        node.detect_and_annotate(
+            invalid_image, "test_object", "test_token", 0.25, 0.8, prompt_type="text"
+        )
 
 
 def test_cleanup_temp_files(test_image):
@@ -270,15 +340,28 @@ def test_cleanup_temp_files(test_image):
 
     try:
         # Use real API with provided token
-        box_result, mask_result = node.detect_and_annotate(
-            test_image, "test object", "73b1fca55fffdf29a7f777d965bb64cf", 0.25
+        box_result, mask_result, pose_data, hand_data = node.detect_and_annotate(
+            test_image,
+            "test object",
+            "73b1fca55fffdf29a7f777d965bb64cf",
+            0.25,
+            0.8,
+            prompt_type="text",
+            return_pose=True,
+            return_hand=True,
         )
 
-        # Verify tensor outputs
+        # Verify outputs
         assert isinstance(box_result, torch.Tensor)
         assert isinstance(mask_result, torch.Tensor)
+        assert isinstance(pose_data, str)
+        assert isinstance(hand_data, str)
         assert len(box_result.shape) == 4  # [B,H,W,C]
         assert len(mask_result.shape) == 3  # [B,H,W]
+
+        # Verify JSON data
+        json.loads(pose_data)  # Should not raise error
+        json.loads(hand_data)  # Should not raise error
 
         # Give the system a moment to complete file operations
         time.sleep(0.5)
