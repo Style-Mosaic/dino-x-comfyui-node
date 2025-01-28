@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
+import torch
 from PIL import Image
 
 from node import DinoxDetectorNode
@@ -27,33 +28,27 @@ def mock_config():
 
 @pytest.fixture
 def synthetic_image():
-    """Create a synthetic test image"""
-    img = np.zeros((100, 100, 3), dtype=np.uint8)
-    img[30:70, 30:70] = 255  # White square
-    return Image.fromarray(img)
+    """Create a synthetic test image tensor [B,H,W,C]"""
+    img = np.zeros((100, 100, 3), dtype=np.float32)
+    img[30:70, 30:70] = 1.0  # White square
+    # Convert to torch tensor with batch dimension
+    return torch.from_numpy(img).unsqueeze(0)  # [1,100,100,3]
 
 
 @pytest.fixture
 def real_image():
-    """Load real test image"""
-    return Image.open("test_leather_jacket.jpg")
+    """Load real test image and convert to tensor [B,H,W,C]"""
+    img = Image.open("test_leather_jacket.jpg")
+    img_np = np.array(img).astype(np.float32) / 255.0
+    return torch.from_numpy(img_np).unsqueeze(0)  # Add batch dimension
 
 
 @pytest.fixture
-def comfyui_tensor_image():
-    """Create a test image in ComfyUI tensor format (values in [0, 1])"""
-    img = np.zeros((100, 100, 3), dtype=np.float32)
-    img[30:70, 30:70] = 1.0  # White square
-    return [img]  # ComfyUI sends as list of tensors
-
-
-@pytest.fixture
-def comfyui_batched_tensor():
-    """Create a test image in ComfyUI batched tensor format (B,H,W,C)"""
-    # Create a batch of size 1 with shape (1, H, W, C)
+def batched_image():
+    """Create a batched test image tensor [B,H,W,C]"""
     img = np.zeros((1, 100, 100, 3), dtype=np.float32)
     img[0, 30:70, 30:70] = 1.0  # White square in first image
-    return [img]  # ComfyUI sends as list of tensors
+    return torch.from_numpy(img)
 
 
 @pytest.fixture
@@ -63,10 +58,7 @@ def mock_predictions():
 
 @pytest.fixture
 def mock_predictions_with_size(test_image):
-    if isinstance(test_image, list):  # Handle ComfyUI tensor format
-        h, w = test_image[0].shape[:2]
-    else:
-        w, h = test_image.size
+    h, w = test_image.shape[1:3]  # Get H,W from tensor [B,H,W,C]
     return create_mock_predictions(h, w)
 
 
@@ -81,18 +73,14 @@ def create_mock_predictions(height, width):
     return [prediction]
 
 
-@pytest.fixture(params=["synthetic", "real", "comfyui", "comfyui_batched"])
-def test_image(
-    request, synthetic_image, real_image, comfyui_tensor_image, comfyui_batched_tensor
-):
+@pytest.fixture(params=["synthetic", "real", "batched"])
+def test_image(request, synthetic_image, real_image, batched_image):
     if request.param == "synthetic":
         return synthetic_image
     elif request.param == "real":
         return real_image
-    elif request.param == "comfyui":
-        return comfyui_tensor_image
     else:
-        return comfyui_batched_tensor
+        return batched_image
 
 
 def test_input_types():
@@ -114,7 +102,7 @@ def test_input_types():
 def test_return_types():
     node = DinoxDetectorNode()
 
-    assert node.RETURN_TYPES == ("IMAGE", "IMAGE")
+    assert node.RETURN_TYPES == ("IMAGE", "MASK")
     assert node.RETURN_NAMES == ("box_annotated", "binary_mask")
     assert node.CATEGORY == "detection"
 
@@ -154,22 +142,24 @@ def test_detect_and_annotate(
             mock_string2rle.return_value = "decoded_rle"
 
             # Run detection
-            box_result, binary_mask = node.detect_and_annotate(
+            box_result, mask_result = node.detect_and_annotate(
                 test_image, "test_object", "test_token", 0.25
             )
 
     # Verify results
-    assert isinstance(box_result, Image.Image)
-    assert isinstance(binary_mask, Image.Image)
-    assert binary_mask.mode == "L", "Binary mask should be in grayscale mode"
-
-    if isinstance(test_image, list):  # ComfyUI tensor format
-        h, w = test_image[0].shape[:2]
-        assert box_result.size == (w, h)
-        assert binary_mask.size == (w, h)
-    else:
-        assert box_result.size == test_image.size
-        assert binary_mask.size == test_image.size
+    assert isinstance(box_result, torch.Tensor)
+    assert isinstance(mask_result, torch.Tensor)
+    assert len(box_result.shape) == 4  # [B,H,W,C]
+    assert len(mask_result.shape) == 3  # [B,H,W]
+    assert box_result.shape[0] == 1  # Batch size 1
+    assert mask_result.shape[0] == 1  # Batch size 1
+    assert box_result.shape[1:3] == test_image.shape[1:3]  # Same H,W as input
+    assert mask_result.shape[1:] == test_image.shape[1:3]  # Same H,W as input
+    assert box_result.shape[-1] == 3  # RGB channels
+    assert torch.all(box_result >= 0) and torch.all(box_result <= 1)  # Values in [0,1]
+    assert torch.all(mask_result >= 0) and torch.all(
+        mask_result <= 1
+    )  # Values in [0,1]
 
 
 def test_leather_jacket_detection(real_image):
@@ -177,7 +167,7 @@ def test_leather_jacket_detection(real_image):
 
     # Use real API with provided token
     try:
-        box_result, binary_mask = node.detect_and_annotate(
+        box_result, mask_result = node.detect_and_annotate(
             real_image,
             "leather jacket . person",
             "73b1fca55fffdf29a7f777d965bb64cf",
@@ -185,66 +175,56 @@ def test_leather_jacket_detection(real_image):
         )
 
         # Verify the results
-        assert isinstance(box_result, Image.Image)
-        assert isinstance(binary_mask, Image.Image)
-        assert binary_mask.mode == "L", "Binary mask should be in grayscale mode"
-        assert box_result.size == real_image.size
-        assert binary_mask.size == real_image.size
+        assert isinstance(box_result, torch.Tensor)
+        assert isinstance(mask_result, torch.Tensor)
+        assert len(box_result.shape) == 4  # [B,H,W,C]
+        assert len(mask_result.shape) == 3  # [B,H,W]
+        assert box_result.shape[0] == 1  # Batch size 1
+        assert mask_result.shape[0] == 1  # Batch size 1
+        assert box_result.shape[1:3] == real_image.shape[1:3]  # Same H,W as input
+        assert mask_result.shape[1:] == real_image.shape[1:3]  # Same H,W as input
+        assert box_result.shape[-1] == 3  # RGB channels
 
         # Save test outputs for visual inspection
         Path("outputs").mkdir(parents=True, exist_ok=True)
-        box_result.save("outputs/test_leather_jacket_box.jpg")
-        binary_mask.save("outputs/test_leather_jacket_mask.png")
+        Image.fromarray((box_result[0].numpy() * 255).astype(np.uint8)).save(
+            "outputs/test_leather_jacket_box.jpg"
+        )
+        Image.fromarray((mask_result[0].numpy() * 255).astype(np.uint8)).save(
+            "outputs/test_leather_jacket_mask.png"
+        )
 
     except Exception as e:
         print(f"API test failed with error: {str(e)}")
         assert False, f"API test failed: {str(e)}"
 
 
-def test_comfyui_tensor_input(comfyui_tensor_image):
-    """Test that node can handle ComfyUI tensor input format"""
+def test_batched_input(batched_image):
+    """Test that node can handle batched tensor input format"""
     node = DinoxDetectorNode()
 
     try:
-        box_result, binary_mask = node.detect_and_annotate(
-            comfyui_tensor_image,
-            "test object",
-            "73b1fca55fffdf29a7f777d965bb64cf",
-            0.25,
+        box_result, mask_result = node.detect_and_annotate(
+            batched_image, "test object", "73b1fca55fffdf29a7f777d965bb64cf", 0.25
         )
 
-        assert isinstance(box_result, Image.Image)
-        assert isinstance(binary_mask, Image.Image)
-        assert binary_mask.mode == "L", "Binary mask should be in grayscale mode"
-        h, w = comfyui_tensor_image[0].shape[:2]
-        assert box_result.size == (w, h)
-        assert binary_mask.size == (w, h)
+        assert isinstance(box_result, torch.Tensor)
+        assert isinstance(mask_result, torch.Tensor)
+        assert len(box_result.shape) == 4  # [B,H,W,C]
+        assert len(mask_result.shape) == 3  # [B,H,W]
+        assert box_result.shape[0] == 1  # Batch size 1
+        assert mask_result.shape[0] == 1  # Batch size 1
+        assert box_result.shape[1:3] == batched_image.shape[1:3]  # Same H,W as input
+        assert mask_result.shape[1:] == batched_image.shape[1:3]  # Same H,W as input
+        assert box_result.shape[-1] == 3  # RGB channels
+        assert torch.all(box_result >= 0) and torch.all(
+            box_result <= 1
+        )  # Values in [0,1]
+        assert torch.all(mask_result >= 0) and torch.all(
+            mask_result <= 1
+        )  # Values in [0,1]
     except Exception as e:
-        assert False, f"Failed to process ComfyUI tensor input: {str(e)}"
-
-
-def test_comfyui_batched_input(comfyui_batched_tensor):
-    """Test that node can handle ComfyUI batched tensor input format"""
-    node = DinoxDetectorNode()
-
-    try:
-        box_result, binary_mask = node.detect_and_annotate(
-            comfyui_batched_tensor,
-            "test object",
-            "73b1fca55fffdf29a7f777d965bb64cf",
-            0.25,
-        )
-
-        assert isinstance(box_result, Image.Image)
-        assert isinstance(binary_mask, Image.Image)
-        assert binary_mask.mode == "L", "Binary mask should be in grayscale mode"
-
-        # Check dimensions after batch dimension is removed
-        h, w = comfyui_batched_tensor[0].shape[1:3]
-        assert box_result.size == (w, h)
-        assert binary_mask.size == (w, h)
-    except Exception as e:
-        assert False, f"Failed to process ComfyUI batched tensor input: {str(e)}"
+        assert False, f"Failed to process batched tensor input: {str(e)}"
 
 
 @pytest.mark.parametrize("threshold", [-0.1, 1.1])
@@ -290,12 +270,15 @@ def test_cleanup_temp_files(test_image):
 
     try:
         # Use real API with provided token
-        box_result, binary_mask = node.detect_and_annotate(
+        box_result, mask_result = node.detect_and_annotate(
             test_image, "test object", "73b1fca55fffdf29a7f777d965bb64cf", 0.25
         )
 
-        # Verify mask is grayscale
-        assert binary_mask.mode == "L", "Binary mask should be in grayscale mode"
+        # Verify tensor outputs
+        assert isinstance(box_result, torch.Tensor)
+        assert isinstance(mask_result, torch.Tensor)
+        assert len(box_result.shape) == 4  # [B,H,W,C]
+        assert len(mask_result.shape) == 3  # [B,H,W]
 
         # Give the system a moment to complete file operations
         time.sleep(0.5)

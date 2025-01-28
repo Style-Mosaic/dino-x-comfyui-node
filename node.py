@@ -9,11 +9,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 import supervision as sv
+import torch
 from dds_cloudapi_sdk import Client, Config, TextPrompt
 from dds_cloudapi_sdk.tasks.detection import DetectionTask
 from dds_cloudapi_sdk.tasks.dinox import DinoxTask
 from dds_cloudapi_sdk.tasks.types import DetectionTarget
-from PIL import Image
 
 
 class DinoxDetectorNode:
@@ -30,7 +30,7 @@ class DinoxDetectorNode:
         """Define the input parameters for the node"""
         return {
             "required": {
-                "image": ("IMAGE",),
+                "image": ("IMAGE",),  # [B,H,W,C] torch.Tensor
                 "text_prompt": (
                     "STRING",
                     {
@@ -46,7 +46,7 @@ class DinoxDetectorNode:
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "IMAGE")  # Returns both box and mask annotations
+    RETURN_TYPES = ("IMAGE", "MASK")  # Returns annotated image and binary mask
     RETURN_NAMES = ("box_annotated", "binary_mask")
     FUNCTION = "detect_and_annotate"
     CATEGORY = "detection"
@@ -80,54 +80,33 @@ class DinoxDetectorNode:
         Process an image with DINO-X API to detect and annotate objects
 
         Args:
-            image: Input image (PIL Image or numpy array)
+            image: Input image tensor [B,H,W,C]
             text_prompt: Text description of objects to detect
             api_token: DINO-X API token
             bbox_threshold: Detection confidence threshold
 
         Returns:
-            tuple: (box_annotated, mask_annotated) - Two PIL Images with annotations
+            tuple: (box_annotated, binary_mask) - Annotated image tensor [B,H,W,C] and mask tensor [B,H,W]
         """
         try:
-            # Handle ComfyUI tensor input
-            if isinstance(image, list):  # ComfyUI sends list of tensors
-                image = image[0]
+            # Convert input tensor to numpy array
+            if not isinstance(image, torch.Tensor):
+                raise ValueError("Expected torch.Tensor input")
 
-            # Convert to numpy array
-            if not isinstance(image, np.ndarray):
-                try:
-                    image = np.array(image)
-
-                    # Handle batch dimension if present (B, H, W, C)
-                    if len(image.shape) == 4:
-                        if image.shape[0] == 1:  # Single batch
-                            image = image[0]  # Remove batch dimension
-                        else:
-                            raise ValueError(
-                                f"Expected batch size 1, got {image.shape[0]}"
-                            )
-                    elif len(image.shape) != 3:
-                        raise ValueError(
-                            f"Expected 3 or 4 dimensions, got shape {image.shape}"
-                        )
-                except:
-                    raise ValueError("Failed to convert input to numpy array")
-
-            # Ensure correct dimensions and scale
-            if len(image.shape) != 3:
+            # Ensure BHWC format
+            if len(image.shape) != 4:
                 raise ValueError(
-                    f"Expected 3 dimensions (H,W,C), got shape {image.shape}"
+                    f"Expected 4D tensor [B,H,W,C], got shape {image.shape}"
                 )
 
-            if image.shape[2] not in [3, 4]:
-                raise ValueError(f"Expected 3 or 4 channels, got {image.shape[2]}")
-
-            # Scale from [0, 1] to [0, 255] and convert to uint8
-            image = (image * 255).astype(np.uint8)
+            # Convert to numpy and scale to [0,255]
+            image_np = (image[0].cpu().numpy() * 255).astype(
+                np.uint8
+            )  # Take first batch
 
             # Convert to BGR for OpenCV
-            image = image[..., :3]  # Take only RGB channels
-            image = image[..., ::-1].copy()  # RGB to BGR
+            image_bgr = image_np[..., ::-1].copy()  # RGB to BGR
+
         except Exception as e:
             raise ValueError(f"Error processing input image: {str(e)}")
 
@@ -136,7 +115,7 @@ class DinoxDetectorNode:
             temp_path = temp_file.name
             try:
                 # Save image to temp file
-                success = cv2.imwrite(temp_path, image)
+                success = cv2.imwrite(temp_path, image_bgr)
                 if not success:
                     raise RuntimeError("Failed to save temporary image")
                 temp_file.flush()
@@ -164,12 +143,11 @@ class DinoxDetectorNode:
 
                 if not predictions:
                     # Return original image and empty mask
-                    empty_mask = np.zeros(
-                        (image.shape[0], image.shape[1]), dtype=np.uint8
-                    )
                     return (
-                        Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)),
-                        Image.fromarray(empty_mask, mode="L"),
+                        image,  # Original image tensor
+                        torch.zeros(
+                            (1, image.shape[1], image.shape[2]), dtype=torch.float32
+                        ),  # Empty mask [B,H,W]
                     )
 
                 # Process predictions
@@ -200,12 +178,12 @@ class DinoxDetectorNode:
                     class_ids.append(class_name_to_id[cls_name])
 
                 if not boxes:
+                    # Return original image and empty mask if no valid detections
                     return (
-                        Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)),
-                        Image.fromarray(
-                            np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8),
-                            mode="L",
-                        ),
+                        image,  # Original image tensor
+                        torch.zeros(
+                            (1, image.shape[1], image.shape[2]), dtype=torch.float32
+                        ),  # Empty mask [B,H,W]
                     )
 
                 boxes = np.array(boxes)
@@ -224,7 +202,7 @@ class DinoxDetectorNode:
                 )
 
                 # Create annotations
-                box_annotated = image.copy()
+                box_annotated = image_bgr.copy()
                 box_annotator = sv.BoxAnnotator()
                 box_annotated = box_annotator.annotate(
                     scene=box_annotated, detections=detections
@@ -233,25 +211,27 @@ class DinoxDetectorNode:
                 box_annotated = label_annotator.annotate(
                     scene=box_annotated, detections=detections, labels=labels
                 )
-                mask_annotator = sv.MaskAnnotator()
-                visualization = mask_annotator.annotate(
-                    scene=box_annotated.copy(), detections=detections
-                )
 
                 # Create binary mask from all detected objects
-                binary_mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+                binary_mask = np.zeros(
+                    (image_np.shape[0], image_np.shape[1]), dtype=np.uint8
+                )
                 for mask in masks:
-                    binary_mask |= mask.astype(np.uint8) * 255
+                    binary_mask |= mask.astype(np.uint8)
 
-                # Convert box annotations back to RGB for ComfyUI
+                # Convert box annotations to RGB
                 box_annotated = cv2.cvtColor(box_annotated, cv2.COLOR_BGR2RGB)
-                box_annotated = Image.fromarray(box_annotated)
 
-                # Convert binary mask to PIL image (mode 'L' for grayscale)
-                binary_mask_pil = Image.fromarray(binary_mask, mode="L")
+                # Convert to torch tensors
+                box_tensor = torch.from_numpy(box_annotated).float() / 255.0  # [H,W,C]
+                mask_tensor = torch.from_numpy(binary_mask).float()  # [H,W]
 
-                # Return box annotations and binary mask
-                return (box_annotated, binary_mask_pil)
+                # Add batch dimension
+                box_tensor = box_tensor.unsqueeze(0)  # [1,H,W,C]
+                mask_tensor = mask_tensor.unsqueeze(0)  # [1,H,W]
+
+                # Return tensors in ComfyUI format
+                return (box_tensor, mask_tensor)
 
             finally:
                 # Clean up temp file
