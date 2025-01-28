@@ -6,12 +6,12 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from .node import DinoxDetectorNode
+from node import DinoxDetectorNode
 
 
 @pytest.fixture
 def mock_client():
-    with patch("dinox_detector.node.Client") as mock:
+    with patch("node.Client") as mock:
         client_instance = Mock()
         mock.return_value = client_instance
         yield client_instance
@@ -19,7 +19,7 @@ def mock_client():
 
 @pytest.fixture
 def mock_config():
-    with patch("dinox_detector.node.Config") as mock:
+    with patch("node.Config") as mock:
         config_instance = Mock()
         mock.return_value = config_instance
         yield config_instance
@@ -34,7 +34,7 @@ def synthetic_image():
 
 @pytest.fixture
 def real_image():
-    return Image.open("test_assets/test_leather_jacket.jpg")
+    return Image.open("test_leather_jacket.jpg")
 
 
 @pytest.fixture
@@ -95,7 +95,7 @@ def test_output_directory_creation():
     assert Path("./outputs/dinox").exists()
 
 
-@patch("dinox_detector.node.DetectionTask")
+@patch("node.DetectionTask")
 def test_detect_and_annotate(
     mock_detection_task,
     mock_client,
@@ -113,8 +113,8 @@ def test_detect_and_annotate(
     mock_detection_task.return_value = task_instance
 
     # Mock RLE to mask conversion
-    with patch("dinox_detector.node.DetectionTask.rle2mask") as mock_rle2mask:
-        with patch("dinox_detector.node.DetectionTask.string2rle") as mock_string2rle:
+    with patch("node.DetectionTask.rle2mask") as mock_rle2mask:
+        with patch("node.DetectionTask.string2rle") as mock_string2rle:
             mock_rle2mask.return_value = np.ones(
                 (test_image.size[1], test_image.size[0]), dtype=bool
             )
@@ -140,7 +140,7 @@ def test_leather_jacket_detection(real_image):
         box_result, mask_result = node.detect_and_annotate(
             real_image,
             "leather jacket . person",
-            "your-api-key",
+            "73b1fca55fffdf29a7f777d965bb64cf",
             0.25,
         )
 
@@ -203,7 +203,9 @@ def test_cleanup_temp_files(test_image):
 
     try:
         # Use real API with provided token
-        node.detect_and_annotate(test_image, "test object", "your-api-key", 0.25)
+        node.detect_and_annotate(
+            test_image, "test object", "73b1fca55fffdf29a7f777d965bb64cf", 0.25
+        )
 
         # Give the system a moment to complete file operations
         time.sleep(0.5)

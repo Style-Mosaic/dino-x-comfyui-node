@@ -1,4 +1,4 @@
-from .node import DinoxDetectorNode
+from node import DinoxDetectorNode
 
 NODE_CLASS_MAPPINGS = {"DinoxDetector": DinoxDetectorNode}
 
