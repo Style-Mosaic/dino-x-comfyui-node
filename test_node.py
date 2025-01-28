@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from node import DinoxDetectorNode
+from .node import DinoxDetectorNode
 
 
 @pytest.fixture

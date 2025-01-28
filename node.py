@@ -88,14 +88,25 @@ class DinoxDetectorNode:
         Returns:
             tuple: (box_annotated, mask_annotated) - Two PIL Images with annotations
         """
-        # Convert ComfyUI image (PIL) to OpenCV format
+        # Convert ComfyUI image to numpy array if needed
         if isinstance(image, Image.Image):
             image = np.array(image)
-        image = image[:, :, ::-1].copy()  # RGB to BGR for OpenCV
-
-        # Handle alpha channel if present
-        if image.shape[2] == 4:
-            image = image[:, :, :3]
+        
+        # Ensure image is a valid numpy array with correct dimensions
+        if not isinstance(image, np.ndarray):
+            raise ValueError("Input image must be a PIL Image or numpy array")
+        
+        if len(image.shape) != 3:
+            raise ValueError(f"Expected 3 dimensions (H,W,C), got shape {image.shape}")
+            
+        if image.shape[2] not in [3, 4]:
+            raise ValueError(f"Expected 3 or 4 channels, got {image.shape[2]}")
+            
+        # Convert to BGR for OpenCV (only if we have a valid 3D array)
+        image = image.copy()  # Make a copy first
+        if image.shape[2] >= 3:  # Check if we have at least 3 channels
+            image = image[..., :3]  # Take only first 3 channels if more exist
+            image = image[..., ::-1]  # Reverse the color channels RGB->BGR
 
         # Use a context manager for temporary file
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_file:
