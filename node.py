@@ -89,14 +89,27 @@ class DinoxDetectorNode:
             tuple: (box_annotated, mask_annotated) - Two PIL Images with annotations
         """
         try:
-            # Convert ComfyUI tensor input (values in [0, 1]) to numpy array
+            # Handle ComfyUI tensor input
             if isinstance(image, list):  # ComfyUI sends list of tensors
                 image = image[0]
 
-            # Convert to numpy array if not already
+            # Convert to numpy array
             if not isinstance(image, np.ndarray):
                 try:
                     image = np.array(image)
+
+                    # Handle batch dimension if present (B, H, W, C)
+                    if len(image.shape) == 4:
+                        if image.shape[0] == 1:  # Single batch
+                            image = image[0]  # Remove batch dimension
+                        else:
+                            raise ValueError(
+                                f"Expected batch size 1, got {image.shape[0]}"
+                            )
+                    elif len(image.shape) != 3:
+                        raise ValueError(
+                            f"Expected 3 or 4 dimensions, got shape {image.shape}"
+                        )
                 except:
                     raise ValueError("Failed to convert input to numpy array")
 

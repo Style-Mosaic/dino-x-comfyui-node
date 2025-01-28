@@ -48,6 +48,15 @@ def comfyui_tensor_image():
 
 
 @pytest.fixture
+def comfyui_batched_tensor():
+    """Create a test image in ComfyUI batched tensor format (B,H,W,C)"""
+    # Create a batch of size 1 with shape (1, H, W, C)
+    img = np.zeros((1, 100, 100, 3), dtype=np.float32)
+    img[0, 30:70, 30:70] = 1.0  # White square in first image
+    return [img]  # ComfyUI sends as list of tensors
+
+
+@pytest.fixture
 def mock_predictions():
     return create_mock_predictions(100, 100)
 
@@ -72,14 +81,18 @@ def create_mock_predictions(height, width):
     return [prediction]
 
 
-@pytest.fixture(params=["synthetic", "real", "comfyui"])
-def test_image(request, synthetic_image, real_image, comfyui_tensor_image):
+@pytest.fixture(params=["synthetic", "real", "comfyui", "comfyui_batched"])
+def test_image(
+    request, synthetic_image, real_image, comfyui_tensor_image, comfyui_batched_tensor
+):
     if request.param == "synthetic":
         return synthetic_image
     elif request.param == "real":
         return real_image
-    else:
+    elif request.param == "comfyui":
         return comfyui_tensor_image
+    else:
+        return comfyui_batched_tensor
 
 
 def test_input_types():
@@ -208,6 +221,30 @@ def test_comfyui_tensor_input(comfyui_tensor_image):
         assert binary_mask.size == (w, h)
     except Exception as e:
         assert False, f"Failed to process ComfyUI tensor input: {str(e)}"
+
+
+def test_comfyui_batched_input(comfyui_batched_tensor):
+    """Test that node can handle ComfyUI batched tensor input format"""
+    node = DinoxDetectorNode()
+
+    try:
+        box_result, binary_mask = node.detect_and_annotate(
+            comfyui_batched_tensor,
+            "test object",
+            "73b1fca55fffdf29a7f777d965bb64cf",
+            0.25,
+        )
+
+        assert isinstance(box_result, Image.Image)
+        assert isinstance(binary_mask, Image.Image)
+        assert binary_mask.mode == "L", "Binary mask should be in grayscale mode"
+
+        # Check dimensions after batch dimension is removed
+        h, w = comfyui_batched_tensor[0].shape[1:3]
+        assert box_result.size == (w, h)
+        assert binary_mask.size == (w, h)
+    except Exception as e:
+        assert False, f"Failed to process ComfyUI batched tensor input: {str(e)}"
 
 
 @pytest.mark.parametrize("threshold", [-0.1, 1.1])
