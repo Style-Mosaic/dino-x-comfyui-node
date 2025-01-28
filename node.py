@@ -50,6 +50,30 @@ class DinoxDetectorNode:
     RETURN_NAMES = ("box_annotated", "mask_annotated")
     FUNCTION = "detect_and_annotate"
     CATEGORY = "detection"
+    OUTPUT_NODE = True  # Mark as output node since we generate visual output
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, api_token, text_prompt, bbox_threshold):
+        """Validate input parameters before execution"""
+        if not api_token:
+            return "API token cannot be empty"
+
+        if not text_prompt.strip():
+            return "Text prompt cannot be empty"
+
+        if bbox_threshold < 0.0 or bbox_threshold > 1.0:
+            return "bbox_threshold must be between 0.0 and 1.0"
+
+        return True
+
+    @classmethod
+    def IS_CHANGED(cls, image, text_prompt, api_token, bbox_threshold):
+        """
+        Control caching behavior. Since we're making API calls that could
+        return different results even with the same inputs, we should
+        always run the node.
+        """
+        return float("NaN")  # Always consider changed due to API nature
 
     def detect_and_annotate(self, image, text_prompt, api_token, bbox_threshold):
         """
@@ -64,27 +88,13 @@ class DinoxDetectorNode:
         Returns:
             tuple: (box_annotated, mask_annotated) - Two PIL Images with annotations
         """
-        # Input validation
-        if not isinstance(image, (np.ndarray, Image.Image)):
-            raise TypeError("Input image must be a PIL Image or numpy array")
-
         # Convert ComfyUI image (PIL) to OpenCV format
         if isinstance(image, Image.Image):
             image = np.array(image)
         image = image[:, :, ::-1].copy()  # RGB to BGR for OpenCV
 
-        # Input validation
-        if not api_token:
-            raise ValueError("API token cannot be empty")
-
-        if not text_prompt.strip():
-            raise ValueError("Text prompt cannot be empty")
-
-        if bbox_threshold < 0.0 or bbox_threshold > 1.0:
-            raise ValueError("bbox_threshold must be between 0.0 and 1.0")
-
-        # Handle alpha channel after type validation
-        if image.shape[2] == 4:  # Remove alpha channel if present
+        # Handle alpha channel if present
+        if image.shape[2] == 4:
             image = image[:, :, :3]
 
         # Use a context manager for temporary file
