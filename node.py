@@ -47,7 +47,7 @@ class DinoxDetectorNode:
         }
 
     RETURN_TYPES = ("IMAGE", "IMAGE")  # Returns both box and mask annotations
-    RETURN_NAMES = ("box_annotated", "mask_annotated")
+    RETURN_NAMES = ("box_annotated", "binary_mask")
     FUNCTION = "detect_and_annotate"
     CATEGORY = "detection"
     OUTPUT_NODE = True  # Mark as output node since we generate visual output
@@ -88,25 +88,35 @@ class DinoxDetectorNode:
         Returns:
             tuple: (box_annotated, mask_annotated) - Two PIL Images with annotations
         """
-        # Convert ComfyUI image to numpy array if needed
-        if isinstance(image, Image.Image):
-            image = np.array(image)
-        
-        # Ensure image is a valid numpy array with correct dimensions
-        if not isinstance(image, np.ndarray):
-            raise ValueError("Input image must be a PIL Image or numpy array")
-        
-        if len(image.shape) != 3:
-            raise ValueError(f"Expected 3 dimensions (H,W,C), got shape {image.shape}")
-            
-        if image.shape[2] not in [3, 4]:
-            raise ValueError(f"Expected 3 or 4 channels, got {image.shape[2]}")
-            
-        # Convert to BGR for OpenCV (only if we have a valid 3D array)
-        image = image.copy()  # Make a copy first
-        if image.shape[2] >= 3:  # Check if we have at least 3 channels
-            image = image[..., :3]  # Take only first 3 channels if more exist
-            image = image[..., ::-1]  # Reverse the color channels RGB->BGR
+        try:
+            # Convert ComfyUI tensor input (values in [0, 1]) to numpy array
+            if isinstance(image, list):  # ComfyUI sends list of tensors
+                image = image[0]
+
+            # Convert to numpy array if not already
+            if not isinstance(image, np.ndarray):
+                try:
+                    image = np.array(image)
+                except:
+                    raise ValueError("Failed to convert input to numpy array")
+
+            # Ensure correct dimensions and scale
+            if len(image.shape) != 3:
+                raise ValueError(
+                    f"Expected 3 dimensions (H,W,C), got shape {image.shape}"
+                )
+
+            if image.shape[2] not in [3, 4]:
+                raise ValueError(f"Expected 3 or 4 channels, got {image.shape[2]}")
+
+            # Scale from [0, 1] to [0, 255] and convert to uint8
+            image = (image * 255).astype(np.uint8)
+
+            # Convert to BGR for OpenCV
+            image = image[..., :3]  # Take only RGB channels
+            image = image[..., ::-1].copy()  # RGB to BGR
+        except Exception as e:
+            raise ValueError(f"Error processing input image: {str(e)}")
 
         # Use a context manager for temporary file
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_file:
@@ -140,9 +150,13 @@ class DinoxDetectorNode:
                     predictions = task.result.objects
 
                 if not predictions:
+                    # Return original image and empty mask
+                    empty_mask = np.zeros(
+                        (image.shape[0], image.shape[1]), dtype=np.uint8
+                    )
                     return (
                         Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)),
-                        Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)),
+                        Image.fromarray(empty_mask, mode="L"),
                     )
 
                 # Process predictions
@@ -175,7 +189,10 @@ class DinoxDetectorNode:
                 if not boxes:
                     return (
                         Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)),
-                        Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)),
+                        Image.fromarray(
+                            np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8),
+                            mode="L",
+                        ),
                     )
 
                 boxes = np.array(boxes)
@@ -204,19 +221,24 @@ class DinoxDetectorNode:
                     scene=box_annotated, detections=detections, labels=labels
                 )
                 mask_annotator = sv.MaskAnnotator()
-                mask_annotated = mask_annotator.annotate(
+                visualization = mask_annotator.annotate(
                     scene=box_annotated.copy(), detections=detections
                 )
 
-                # Convert back to RGB for ComfyUI
+                # Create binary mask from all detected objects
+                binary_mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+                for mask in masks:
+                    binary_mask |= mask.astype(np.uint8) * 255
+
+                # Convert box annotations back to RGB for ComfyUI
                 box_annotated = cv2.cvtColor(box_annotated, cv2.COLOR_BGR2RGB)
-                mask_annotated = cv2.cvtColor(mask_annotated, cv2.COLOR_BGR2RGB)
-
-                # Convert to PIL images
                 box_annotated = Image.fromarray(box_annotated)
-                mask_annotated = Image.fromarray(mask_annotated)
 
-                return (box_annotated, mask_annotated)
+                # Convert binary mask to PIL image (mode 'L' for grayscale)
+                binary_mask_pil = Image.fromarray(binary_mask, mode="L")
+
+                # Return box annotations and binary mask
+                return (box_annotated, binary_mask_pil)
 
             finally:
                 # Clean up temp file
